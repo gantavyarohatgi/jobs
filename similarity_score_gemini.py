@@ -35,9 +35,9 @@ CACHE_FILE = "similarity_cache.json"
 MATRIX_FILE = "similarity_matrix.json"
 
 # Rate limiting settings for Gemini free tier
-RATE_LIMIT_RPM = 15  # Requests per minute
-RATE_LIMIT_TPD = 1_500_000  # Tokens per day
-DELAY_BETWEEN_REQUESTS = 4  # 4 second delay = ~15 req/min
+RATE_LIMIT_DELAY = 0.3  # seconds between API calls
+MAX_RETRIES = 5
+BASE_BACKOFF = 2  # exponential backoff base
 
 SIMILARITY_PROMPT = """\
 You are a job analyst comparing two occupations based on their **Key Duties** and **Education & Skills**.
@@ -80,29 +80,14 @@ Respond with ONLY a JSON object in this exact format, no other text:
 """
 
 
-class RateLimiter:
-    """Handles rate limiting for Gemini API."""
-    
-    def __init__(self, rpm=RATE_LIMIT_RPM):
-        self.rpm = rpm
-        self.delay = 60 / rpm  # Calculate delay between requests
-        self.last_request_time = 0
-    
-    def wait_if_needed(self):
-        """Wait if necessary to respect rate limits."""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.delay:
-            wait_time = self.delay - elapsed
-            time.sleep(wait_time)
-        self.last_request_time = time.time()
-
-
 class SimilarityCache:
-    """Manages caching of job similarity comparisons."""
+    """Manages caching with incremental saving and resume capability."""
     
-    def __init__(self, cache_file=CACHE_FILE):
+    def __init__(self, cache_file=SIMILARITY_CACHE):
         self.cache_file = cache_file
         self.cache = {}
+        self.comparisons_made = 0
+        self.comparisons_cached = 0
         self.load()
     
     def load(self):
@@ -111,33 +96,33 @@ class SimilarityCache:
             try:
                 with open(self.cache_file) as f:
                     self.cache = json.load(f)
-                print(f"✅ Loaded {len(self.cache)} cached comparisons")
+                print(f"✅ Cache loaded: {len(self.cache)} entries\n")
             except json.JSONDecodeError:
-                print("⚠️  Cache file corrupted, starting fresh")
+                print(f"⚠️  Cache file corrupted, starting fresh\n")
                 self.cache = {}
         else:
-            self.cache = {}
+            print(f"📝 New cache file will be created: {self.cache_file}\n")
     
     def save(self):
-        """Save cache to disk."""
-        try:
-            with open(self.cache_file, "w") as f:
-                json.dump(self.cache, f, indent=2)
-        except Exception as e:
-            print(f"❌ Error saving cache: {e}")
+        """Save cache to disk immediately."""
+        with open(self.cache_file, 'w') as f:
+            json.dump(self.cache, f, indent=2)
     
     def get_key(self, slug1, slug2):
-        """Generate a canonical cache key (order-independent)."""
+        """Generate canonical cache key (order-independent)."""
         pair = tuple(sorted([slug1, slug2]))
         return hashlib.md5("|".join(pair).encode()).hexdigest()
     
     def get(self, slug1, slug2):
-        """Retrieve a cached comparison."""
+        """Retrieve cached comparison."""
         key = self.get_key(slug1, slug2)
-        return self.cache.get(key)
+        if key in self.cache:
+            self.comparisons_cached += 1
+            return self.cache[key]
+        return None
     
     def set(self, slug1, slug2, result):
-        """Store a comparison in cache."""
+        """Store comparison in cache and save immediately."""
         key = self.get_key(slug1, slug2)
         self.cache[key] = {
             "slug1": slug1,
@@ -145,378 +130,346 @@ class SimilarityCache:
             "timestamp": time.time(),
             **result
         }
-        self.save()  # Save after each entry
+        self.comparisons_made += 1
+        self.save()  # ✅ Save after each comparison
     
-    def clear(self):
-        """Clear the cache."""
-        self.cache = {}
-        self.save()
-        print("✅ Cache cleared")
-
-
-def get_job_descriptions_from_markdown(slug):
-    """Extract Key Duties and Education & Skills from markdown file."""
-    md_path = f"pages/{slug}.md"
-    
-    if not os.path.exists(md_path):
-        return None
-    
-    try:
-        with open(md_path) as f:
-            content = f.read()
-        
-        # Extract Key Duties section
-        duties_start = content.find("**Key Duties**")
-        duties_end = content.find("\n**", duties_start + 1) if duties_start != -1 else -1
-        duties = content[duties_start:duties_end] if duties_start != -1 else "Key Duties not found"
-        
-        # Extract Education & Skills section
-        skills_start = content.find("**Education & Skills**")
-        skills_end = len(content)
-        skills = content[skills_start:skills_end] if skills_start != -1 else "Education & Skills not found"
-        
+    def get_stats(self):
+        """Return cache statistics."""
         return {
-            "slug": slug,
-            "duties": duties,
-            "skills": skills
+            "total_cached": len(self.cache),
+            "comparisons_made": self.comparisons_made,
+            "comparisons_cached": self.comparisons_cached,
         }
-    except Exception as e:
-        print(f"❌ Error reading {md_path}: {e}")
-        return None
 
 
-def compare_jobs_gemini(model, job1_data, job2_data, rate_limiter, max_retries=5):
+def load_csv_data():
+    """Load job data from CSV."""
+    
+    jobs = {}
+    
+    with open(CSV_FILE, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            slug = row.get('slug') or row.get('Slug')
+            if not slug:
+                continue
+            
+            jobs[slug] = {
+                'title': row.get('title') or row.get('Title') or 'Unknown',
+                'category': row.get('category') or row.get('Category') or 'General',
+                'description': row.get('description') or row.get('Description') or '',
+                'url': row.get('url') or row.get('URL') or '',
+            }
+    
+    print(f"📚 Loaded {len(jobs)} jobs from CSV\n")
+    return jobs
+
+
+def compare_jobs_with_gemini(model, job1_title, job1_desc, job2_title, job2_desc):
     """
-    Compare two jobs using Gemini 2.0 Flash with exponential backoff.
+    Compare two jobs using Gemini with intelligent rate limiting and retries.
     
-    Args:
-        model: Gemini model instance
-        job1_data: First job data dict
-        job2_data: Second job data dict
-        rate_limiter: RateLimiter instance
-        max_retries: Max retry attempts on rate limit
-    
-    Returns:
-        dict: Similarity score result
+    Rate Limiting Strategy:
+    - Base delay: 0.3s between calls
+    - Quota errors: exponential backoff (1s, 2s, 4s, 8s, 16s)
+    - Server errors: 5s, 10s, 15s delays
     """
     
     comparison_text = f"""
-Job 1: {job1_data['slug']}
-{job1_data['duties']}
-{job1_data['skills']}
+Job 1: {job1_title}
+Description: {job1_desc[:400]}
 
-Job 2: {job2_data['slug']}
-{job2_data['duties']}
-{job2_data['skills']}
+Job 2: {job2_title}
+Description: {job2_desc[:400]}
 
-Compare these two jobs based on Key Duties and Education & Skills.
+Compare these jobs.
 """
     
     full_prompt = f"{SIMILARITY_PROMPT}\n\n{comparison_text}"
     
-    for attempt in range(max_retries):
+    for attempt in range(MAX_RETRIES):
         try:
-            # Respect rate limits
-            rate_limiter.wait_if_needed()
-            
-            # Call Gemini API
-            response = model.generate_content(
-                full_prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=500,
-                )
-            )
-            
+            response = model.generate_content(full_prompt)
             content = response.text.strip()
             
-            # Strip markdown code fences if present
+            # Strip markdown fences
             if content.startswith("```"):
-                content = content.split("\n", 1)[1] if "\n" in content else content
-                if content.endswith("```"):
-                    content = content[:-3]
-                content = content.strip()
+                lines = content.split("\n")
+                content = "\n".join(lines[1:-1]) if len(lines) > 2 else content
             
             result = json.loads(content)
             
-            # Validate result structure
-            required_keys = ["similarity_score", "duty_overlap_percent", "skill_overlap_percent", 
-                           "shared_duties", "shared_skills", "key_differences", "rationale"]
-            if not all(key in result for key in required_keys):
-                raise ValueError("Missing required keys in response")
+            # ✅ Rate limiting after successful call
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RATE_LIMIT_DELAY)
             
             return result
-            
+        
         except json.JSONDecodeError as e:
-            print(f" [JSON Error: {e}]", end="", flush=True)
-            if attempt == max_retries - 1:
+            print(f"\n  ❌ JSON parse error: {e}")
+            print(f"  Response was: {content[:100]}...")
+            if attempt == MAX_RETRIES - 1:
                 raise
-            time.sleep(2 ** attempt)
-            
+            time.sleep(BASE_BACKOFF ** attempt)
+            continue
+        
         except Exception as e:
             error_msg = str(e).lower()
             
-            # Check for rate limit error
-            if "quota" in error_msg or "rate" in error_msg or "429" in error_msg or "resource_exhausted" in error_msg:
-                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                print(f"\n⏳ Rate limit hit. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...", flush=True)
+            # ✅ QUOTA/RATE LIMIT - Exponential backoff
+            if any(x in error_msg for x in ["quota", "rate", "429", "too_many_requests"]):
+                wait_time = BASE_BACKOFF ** attempt
+                print(f"\n  ⏳ RATE LIMIT HIT!")
+                print(f"  Gemini free tier quota exceeded")
+                print(f"  Waiting {wait_time}s before retry (attempt {attempt + 1}/{MAX_RETRIES})...")
                 time.sleep(wait_time)
                 continue
             
-            # Check for server errors
-            if "500" in error_msg or "service" in error_msg or "unavailable" in error_msg:
+            # SERVER ERROR - Longer delays
+            if any(x in error_msg for x in ["500", "502", "503", "service"]):
                 wait_time = 5 * (attempt + 1)
-                print(f"\n⚠️  Server error. Waiting {wait_time}s...", flush=True)
+                print(f"\n  ⚠️  SERVER ERROR ({error_msg[:30]})")
+                print(f"  Waiting {wait_time}s...")
                 time.sleep(wait_time)
                 continue
             
-            if attempt == max_retries - 1:
+            # AUTHENTICATION ERROR
+            if "api key" in error_msg or "auth" in error_msg:
+                print(f"\n  ❌ Authentication failed: {e}")
                 raise
             
-            print(f"\n❌ Error (attempt {attempt + 1}): {e}. Retrying...", flush=True)
-            time.sleep(2 ** attempt)
+            # OTHER ERRORS
+            if attempt == MAX_RETRIES - 1:
+                raise
+            
+            print(f"\n  ⚠️  Error (attempt {attempt + 1}/{MAX_RETRIES}): {e}")
+            time.sleep(BASE_BACKOFF ** attempt)
     
-    raise Exception(f"Failed after {max_retries} attempts")
+    raise Exception(f"Failed after {MAX_RETRIES} retries")
 
 
-def compare_single_job(target_slug, top_n=10):
-    """Compare a single job against all occupations."""
+def find_similar_jobs(target_slug, top_n=10):
+    """Find similar jobs for a target job."""
     
-    # Configure Gemini API
+    # Configure Gemini
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("❌ GEMINI_API_KEY not found in .env file")
-        print("   Set it via: export GEMINI_API_KEY='your_key'")
-        print("   Or add to .env: GEMINI_API_KEY=your_key")
+        print("❌ GEMINI_API_KEY not found in .env")
         return
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(GEMINI_MODEL)
     
-    with open("occupations.json") as f:
-        all_occupations = json.load(f)
+    # Load data
+    jobs = load_csv_data()
+    cache = SimilarityCache()
     
-    target_data = get_job_descriptions_from_markdown(target_slug)
-    if not target_data:
-        print(f"❌ Could not find markdown for {target_slug}")
+    if target_slug not in jobs:
+        print(f"❌ Job '{target_slug}' not found in CSV")
+        print(f"Available jobs: {', '.join(list(jobs.keys())[:5])}...")
         return
     
-    target_title = next((occ["title"] for occ in all_occupations if occ["slug"] == target_slug), target_slug)
-    print(f"\n🔍 Analyzing: {target_title} ({target_slug})")
-    print(f"Comparing against {len(all_occupations)} occupations...")
-    print(f"⏱️  Rate limit: 15 requests/min, 1.5M tokens/day\n")
+    target_job = jobs[target_slug]
+    target_title = target_job['title']
+    target_desc = target_job['description']
     
-    cache = SimilarityCache()
-    rate_limiter = RateLimiter(rpm=RATE_LIMIT_RPM)
+    print(f"🔍 Finding similar jobs to: {target_title}")
+    print(f"📊 Model: {GEMINI_MODEL}")
+    print(f"⏱️  Rate limit: 0.3s between calls")
+    print(f"💾 Cache file: {SIMILARITY_CACHE}")
+    print(f"Comparing against {len(jobs)} occupations...\n")
     
     similarities = []
-    cached_count = 0
-    api_count = 0
-    error_count = 0
-    
     start_time = time.time()
     
-    for i, occ in enumerate(all_occupations):
-        slug = occ["slug"]
-        
-        # Skip the target job itself
+    for i, (slug, job_data) in enumerate(jobs.items()):
         if slug == target_slug:
             continue
         
-        comp_data = get_job_descriptions_from_markdown(slug)
-        if not comp_data:
-            continue
-        
-        print(f"  [{i+1}/{len(all_occupations)}] {occ['title']}...", end=" ", flush=True)
+        print(f"  [{i+1:3d}/{len(jobs)}] {job_data['title']:<40}", end=" ", flush=True)
         
         try:
-            # Check cache first
+            # ✅ Check cache first
             cached = cache.get(target_slug, slug)
             if cached:
                 result = {k: v for k, v in cached.items() if k not in ["slug1", "slug2", "timestamp"]}
                 print("(cached)")
-                cached_count += 1
             else:
-                result = compare_jobs_gemini(model, target_data, comp_data, rate_limiter)
+                # Call Gemini API
+                result = compare_jobs_with_gemini(
+                    model,
+                    target_title,
+                    target_desc,
+                    job_data['title'],
+                    job_data['description']
+                )
+                # ✅ Save to cache immediately
                 cache.set(target_slug, slug, result)
-                print(f"Score: {result['similarity_score']}/100")
-                api_count += 1
+                print(f"Score: {result['similarity_score']:3d}/100")
             
             similarities.append({
                 "slug": slug,
-                "title": occ["title"],
-                "category": occ["category"],
+                "title": job_data['title'],
+                "category": job_data['category'],
                 **result
             })
+        
         except Exception as e:
-            print(f"ERROR: {e}")
-            error_count += 1
+            print(f"ERROR: {str(e)[:50]}")
     
-    elapsed = time.time() - start_time
+    elapsed_time = time.time() - start_time
     
     # Sort by similarity score
-    similarities.sort(key=lambda x: x["similarity_score"], reverse=True)
+    similarities.sort(key=lambda x: x['similarity_score'], reverse=True)
     
-    # Display results
-    print(f"\n{'='*80}")
+    # ✅ Display results
+    print(f"\n{'='*100}")
     print(f"Top {top_n} Most Similar Jobs to: {target_title}")
-    print(f"{'='*80}\n")
+    print(f"{'='*100}\n")
     
     for idx, job in enumerate(similarities[:top_n], 1):
-        print(f"{idx}. {job['title']} (Similarity: {job['similarity_score']}/100)")
-        print(f"   Slug: {job['slug']}")
-        print(f"   Category: {job['category']}")
-        print(f"   Duty Overlap: {job['duty_overlap_percent']}% | Skill Overlap: {job['skill_overlap_percent']}%")
-        print(f"   Shared Skills: {', '.join(job['shared_skills'][:3])}...")
-        print(f"   Key Differences: {', '.join(job['key_differences'][:2])}...")
-        print(f"   Rationale: {job['rationale'][:100]}...")
-        print()
+        print(f"{idx:2d}. {job['title']:<50} (Score: {job['similarity_score']:3d}/100)")
+        print(f"    Category: {job['category']:<20} Duty: {job['duty_overlap_percent']:3d}% | Skill: {job['skill_overlap_percent']:3d}%")
+        print(f"    Skills: {', '.join(job['shared_skills'][:2])}")
+        print(f"    Rationale: {job['rationale'][:70]}...\n")
     
-    # Save results
+    # ✅ Save results to file
     output_file = f"similarity_results_{target_slug}.json"
-    with open(output_file, "w") as f:
+    with open(output_file, 'w') as f:
         json.dump(similarities, f, indent=2)
+    print(f"✅ Results saved to: {output_file}")
     
-    print(f"\n{'='*80}")
-    print(f"✅ Full results saved to: {output_file}")
-    print(f"📊 Statistics:")
-    print(f"   - API calls: {api_count}")
-    print(f"   - From cache: {cached_count}")
-    print(f"   - Errors: {error_count}")
-    print(f"   - Total time: {elapsed:.1f}s")
-    print(f"   - Cache file: {CACHE_FILE} ({len(cache.cache)} total entries)")
-    print(f"{'='*80}\n")
+    # ✅ Print statistics
+    stats = cache.get_stats()
+    print(f"\n{'='*100}")
+    print(f"📊 STATISTICS:")
+    print(f"{'='*100}")
+    print(f"⏱️  Time elapsed: {elapsed_time:.1f}s")
+    print(f"📝 Total cached: {stats['total_cached']}")
+    print(f"🆕 New API calls: {stats['comparisons_made']}")
+    print(f"♻️  From cache: {stats['comparisons_cached']}")
+    print(f"💾 Cache file: {SIMILARITY_CACHE}")
+    print(f"📄 Results file: {output_file}")
+    print(f"⏱️  Daily limit: 1.5M tokens (track at console.cloud.google.com)")
 
 
 def batch_compare_jobs(target_slugs, top_n=10):
-    """Compare multiple jobs."""
+    """Compare multiple jobs in batch."""
     
-    # Configure Gemini API
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("❌ GEMINI_API_KEY not found in .env file")
+        print("❌ GEMINI_API_KEY not found")
         return
     
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(GEMINI_MODEL)
     
-    with open("occupations.json") as f:
-        all_occupations = json.load(f)
-    
+    jobs = load_csv_data()
     cache = SimilarityCache()
-    rate_limiter = RateLimiter(rpm=RATE_LIMIT_RPM)
     
-    all_results = {}
+    batch_start = time.time()
     
     for target_slug in target_slugs:
-        target_data = get_job_descriptions_from_markdown(target_slug)
-        if not target_data:
-            print(f"❌ Could not find markdown for {target_slug}")
+        if target_slug not in jobs:
+            print(f"⚠️  Job '{target_slug}' not found, skipping...")
             continue
         
-        target_title = next((occ["title"] for occ in all_occupations if occ["slug"] == target_slug), target_slug)
-        print(f"\n🔍 Analyzing: {target_title}")
+        target_job = jobs[target_slug]
+        print(f"\n🔍 Analyzing: {target_job['title']}\n")
         
         similarities = []
         
-        for i, occ in enumerate(all_occupations):
-            slug = occ["slug"]
-            
+        for i, (slug, job_data) in enumerate(jobs.items()):
             if slug == target_slug:
                 continue
             
-            comp_data = get_job_descriptions_from_markdown(slug)
-            if not comp_data:
-                continue
-            
-            print(f"  [{i+1}] {occ['title']}...", end=" ", flush=True)
+            print(f"  [{i+1:3d}] {job_data['title']:<40}", end=" ", flush=True)
             
             try:
                 cached = cache.get(target_slug, slug)
                 if cached:
                     result = {k: v for k, v in cached.items() if k not in ["slug1", "slug2", "timestamp"]}
-                    print("(cached)")
+                    print("✓")
                 else:
-                    result = compare_jobs_gemini(model, target_data, comp_data, rate_limiter)
+                    result = compare_jobs_with_gemini(
+                        model,
+                        target_job['title'],
+                        target_job['description'],
+                        job_data['title'],
+                        job_data['description']
+                    )
                     cache.set(target_slug, slug, result)
-                    print(f"✓")
+                    print("✓")
                 
                 similarities.append({
                     "slug": slug,
-                    "title": occ["title"],
-                    "category": occ["category"],
+                    "title": job_data['title'],
+                    "category": job_data['category'],
                     **result
                 })
+            
             except Exception as e:
-                print(f"ERROR: {e}")
+                print(f"ERROR: {str(e)[:40]}")
         
-        similarities.sort(key=lambda x: x["similarity_score"], reverse=True)
-        all_results[target_slug] = similarities
+        similarities.sort(key=lambda x: x['similarity_score'], reverse=True)
         
-        # Display top N
         print(f"\n{'='*80}")
-        print(f"Top {top_n} Most Similar to: {target_title}")
+        print(f"Top {top_n} Similar Jobs:")
         print(f"{'='*80}\n")
         
         for idx, job in enumerate(similarities[:top_n], 1):
-            print(f"{idx}. {job['title']} ({job['similarity_score']}/100)")
+            print(f"{idx:2d}. {job['title']:<50} ({job['similarity_score']:3d}/100)")
     
-    return all_results
+    batch_elapsed = time.time() - batch_start
+    print(f"\n✅ Batch complete in {batch_elapsed:.1f}s")
+    
+    # ✅ Final statistics
+    stats = cache.get_stats()
+    print(f"\n{'='*80}")
+    print(f"📊 FINAL STATISTICS:")
+    print(f"{'='*80}")
+    print(f"Total comparisons: {stats['comparisons_made'] + stats['comparisons_cached']}")
+    print(f"New API calls: {stats['comparisons_made']}")
+    print(f"From cache: {stats['comparisons_cached']}")
+    print(f"Cache efficiency: {(stats['comparisons_cached']/(stats['comparisons_made']+stats['comparisons_cached'])*100):.1f}%")
+    print(f"Cache file: {SIMILARITY_CACHE} ({len(cache.cache)} entries)")
 
 
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(
-        description="Find similar jobs using Google Gemini 2.0 Flash",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Compare single job
-  python similarity_score_gemini.py single medical-transcriptionists --top 15
-  
-  # Batch compare multiple jobs
-  python similarity_score_gemini.py batch software-developers data-scientists --top 10
-  
-  # Cache management
-  python similarity_score_gemini.py cache --stats
-  python similarity_score_gemini.py cache --clear
-        """
-    )
+    parser = argparse.ArgumentParser(description="Find similar jobs using CSV and Gemini")
+    subparsers = parser.add_subparsers(dest="command", help="Command")
     
-    subparsers = parser.add_subparsers(dest="command", help="Command to run")
-    
-    single = subparsers.add_parser("single", help="Compare single job")
-    single.add_argument("job_slug", help="Job slug to analyze")
-    single.add_argument("--top", type=int, default=10, help="Number of similar jobs to show")
+    single = subparsers.add_parser("single", help="Find similar jobs to one occupation")
+    single.add_argument("job_slug", help="Job slug from CSV")
+    single.add_argument("--top", type=int, default=10, help="Top N results")
     
     batch = subparsers.add_parser("batch", help="Compare multiple jobs")
-    batch.add_argument("job_slugs", nargs="+", help="Job slugs to compare")
-    batch.add_argument("--top", type=int, default=10, help="Number of similar jobs to show")
+    batch.add_argument("job_slugs", nargs="+", help="Job slugs")
+    batch.add_argument("--top", type=int, default=10, help="Top N results")
     
     cache_cmd = subparsers.add_parser("cache", help="Manage cache")
-    cache_cmd.add_argument("--stats", action="store_true", help="Show cache statistics")
-    cache_cmd.add_argument("--clear", action="store_true", help="Clear all cached comparisons")
+    cache_cmd.add_argument("--stats", action="store_true", help="Show cache stats")
+    cache_cmd.add_argument("--clear", action="store_true", help="Clear cache")
     
     args = parser.parse_args()
     
     if args.command == "single":
-        compare_single_job(args.job_slug, top_n=args.top)
+        find_similar_jobs(args.job_slug, top_n=args.top)
     elif args.command == "batch":
         batch_compare_jobs(args.job_slugs, top_n=args.top)
     elif args.command == "cache":
         cache = SimilarityCache()
-        if args.clear:
-            cache.clear()
-        elif args.stats:
+        stats = cache.get_stats()
+        if args.stats:
             print(f"\n📊 Cache Statistics:")
-            print(f"   Total cached comparisons: {len(cache.cache)}")
-            print(f"   Cache file: {CACHE_FILE}")
-            if os.path.exists(CACHE_FILE):
-                size_kb = os.path.getsize(CACHE_FILE) / 1024
-                print(f"   Cache size: {size_kb:.1f} KB")
-            print()
-        else:
-            print(f"✅ Cache loaded: {len(cache.cache)} comparisons")
+            print(f"   Total entries: {len(cache.cache)}")
+            print(f"   File: {SIMILARITY_CACHE}")
+            print(f"   File size: {os.path.getsize(SIMILARITY_CACHE) / 1024:.1f} KB")
+        elif args.clear:
+            cache.cache = {}
+            cache.save()
+            print("✅ Cache cleared")
     else:
         parser.print_help()
