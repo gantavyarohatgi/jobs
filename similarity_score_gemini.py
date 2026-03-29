@@ -30,7 +30,8 @@ except ImportError:
 load_dotenv()
 
 # Gemini 2.0 Flash - Free, fast, high quality
-GEMINI_MODEL = "gemini-3.0-flash"
+GEMINI_MODEL = "gemini-3.0-flash"\
+CSV_FILE = "occupations.csv"
 CACHE_FILE = "similarity_cache.json"
 MATRIX_FILE = "similarity_matrix.json"
 
