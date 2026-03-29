@@ -83,7 +83,7 @@ Respond with ONLY a JSON object in this exact format, no other text:
 class SimilarityCache:
     """Manages caching with incremental saving and resume capability."""
     
-    def __init__(self, cache_file=SIMILARITY_CACHE):
+    def __init__(self, cache_file=CACHE_FILE):
         self.cache_file = cache_file
         self.cache = {}
         self.comparisons_made = 0
@@ -276,7 +276,7 @@ def find_similar_jobs(target_slug, top_n=10):
     print(f"🔍 Finding similar jobs to: {target_title}")
     print(f"📊 Model: {GEMINI_MODEL}")
     print(f"⏱️  Rate limit: 0.3s between calls")
-    print(f"💾 Cache file: {SIMILARITY_CACHE}")
+    print(f"💾 Cache file: {CACHE_FILE}")
     print(f"Comparing against {len(jobs)} occupations...\n")
     
     similarities = []
@@ -348,7 +348,7 @@ def find_similar_jobs(target_slug, top_n=10):
     print(f"📝 Total cached: {stats['total_cached']}")
     print(f"🆕 New API calls: {stats['comparisons_made']}")
     print(f"♻️  From cache: {stats['comparisons_cached']}")
-    print(f"💾 Cache file: {SIMILARITY_CACHE}")
+    print(f"💾 Cache file: {CACHE_FILE}")
     print(f"📄 Results file: {output_file}")
     print(f"⏱️  Daily limit: 1.5M tokens (track at console.cloud.google.com)")
 
@@ -432,7 +432,7 @@ def batch_compare_jobs(target_slugs, top_n=10):
     print(f"New API calls: {stats['comparisons_made']}")
     print(f"From cache: {stats['comparisons_cached']}")
     print(f"Cache efficiency: {(stats['comparisons_cached']/(stats['comparisons_made']+stats['comparisons_cached'])*100):.1f}%")
-    print(f"Cache file: {SIMILARITY_CACHE} ({len(cache.cache)} entries)")
+    print(f"Cache file: {CACHE_FILE} ({len(cache.cache)} entries)")
 
 
 if __name__ == "__main__":
@@ -465,8 +465,8 @@ if __name__ == "__main__":
         if args.stats:
             print(f"\n📊 Cache Statistics:")
             print(f"   Total entries: {len(cache.cache)}")
-            print(f"   File: {SIMILARITY_CACHE}")
-            print(f"   File size: {os.path.getsize(SIMILARITY_CACHE) / 1024:.1f} KB")
+            print(f"   File: {CACHE_FILE}")
+            print(f"   File size: {os.path.getsize(CACHE_FILE) / 1024:.1f} KB")
         elif args.clear:
             cache.cache = {}
             cache.save()
