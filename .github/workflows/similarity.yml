@@ -9,7 +9,7 @@ jobs:
   score:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -25,9 +25,16 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python similarity_score_gemini.py single medical-transcriptionists --top 20
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: similarity-results
+          path: similarity_results_*.json
+          retention-days: 30
           
       - name: Upload cache
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: similarity-cache
           path: similarity_cache.json
