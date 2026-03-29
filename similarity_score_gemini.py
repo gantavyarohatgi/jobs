@@ -25,7 +25,7 @@ load_dotenv()
 
 CSV_FILE = "occupations.csv"
 SIMILARITY_CACHE = "similarity_cache.json"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-3-flash"
 
 # Rate Limiting Configuration
 RATE_LIMIT_DELAY = 0.3  # seconds between API calls
@@ -33,18 +33,42 @@ MAX_RETRIES = 5
 BASE_BACKOFF = 2  # exponential backoff base
 
 SIMILARITY_PROMPT = """\
-You are a job analyst comparing two occupations.
-Analyze duty overlap, skill overlap, and overall similarity.
+You are a job analyst comparing two occupations based on their **Key Duties** and **Education & Skills**.
 
-Return ONLY valid JSON in this exact format:
+You will receive descriptions of two occupations. Your task is to:
+1. Extract the key duties from each occupation
+2. Extract the education and skills requirements from each
+3. Compare them for similarity
+4. Provide a **Job Similarity Score** from 0-100
+
+Scoring guidelines:
+- **90-100: Nearly identical jobs.** Same duties, same education/skills.
+  Examples: Software Developer vs Software Engineer, Registered Nurse vs RN
+  
+- **75-89: Very similar jobs.** 80%+ overlap in duties and requirements.
+  Examples: Electrician vs Electrical Technician, Accountant vs Bookkeeper
+  
+- **60-74: Similar jobs.** Significant overlap in duties (50-75%) and education.
+  Examples: Teacher vs Trainer, Graphic Designer vs Web Designer
+  
+- **40-59: Moderately similar.** Some overlap in skills/education but different core duties.
+  Examples: Carpenter vs Electrician, Nurse vs Medical Assistant
+  
+- **20-39: Somewhat related.** Limited overlap, different fields but adjacent.
+  Examples: Data Analyst vs Business Analyst, Marketing Manager vs Sales Manager
+  
+- **0-19: Unrelated jobs.** Minimal overlap in duties or requirements.
+  Examples: Software Developer vs Dentist, Roofer vs Accountant
+
+Respond with ONLY a JSON object in this exact format, no other text:
 {
   "similarity_score": <0-100>,
   "duty_overlap_percent": <0-100>,
   "skill_overlap_percent": <0-100>,
-  "shared_duties": ["<duty1>", "<duty2>", "<duty3>"],
-  "shared_skills": ["<skill1>", "<skill2>", "<skill3>"],
-  "key_differences": ["<diff1>", "<diff2>"],
-  "rationale": "<explanation>"
+  "shared_duties": ["<duty1>", "<duty2>", ...],
+  "shared_skills": ["<skill1>", "<skill2>", ...],
+  "key_differences": ["<difference1>", "<difference2>", ...],
+  "rationale": "<2-3 sentences explaining the score>"
 }
 """
 
