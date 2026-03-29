@@ -1,90 +1,62 @@
 """
-Score job similarity between occupations using Google Gemini 3.0 Flash (free).
+Calculate job similarity scores using occupations.csv and Gemini API.
 
-Features:
-- Batch comparison with intelligent caching
-- Rate limit handling (15 req/min, 1.5M tokens/day)
-- Exponential backoff retry logic
-- Similarity matrix generation
-- Resume on interruption with incremental cache saves
-- Optimized for Gemini 3.0 Flash model
-
-Usage:
-    python similarity_score_gemini.py single medical-transcriptionists --top 15
-    python similarity_score_gemini.py batch software-developers data-scientists --top 10
+✅ Features:
+- Rate limiting (0.3s between calls, exponential backoff on quota)
+- Persistent caching (similarity_cache.json)
+- Incremental file saving (saves after each job)
+- Resume capability (picks up where it left off)
+- Detailed logging
 """
 
 import json
 import os
+import csv
 import time
 import hashlib
-import sys
 from dotenv import load_dotenv
-
-try:
-    import google.generativeai as genai
-except ImportError:
-    print("❌ google-generativeai not installed. Run: pip install google-generativeai")
-    sys.exit(1)
+import google.generativeai as genai
 
 load_dotenv()
 
-# Gemini 2.0 Flash - Free, fast, high quality
-GEMINI_MODEL = "gemini-3.0-flash"\
-CSV_FILE = "occupations.csv"
-CACHE_FILE = "similarity_cache.json"
-MATRIX_FILE = "similarity_matrix.json"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 
-# Rate limiting settings for Gemini free tier
+CSV_FILE = "occupations.csv"
+SIMILARITY_CACHE = "similarity_cache.json"
+GEMINI_MODEL = "gemini-1.5-flash"
+
+# Rate Limiting Configuration
 RATE_LIMIT_DELAY = 0.3  # seconds between API calls
 MAX_RETRIES = 5
 BASE_BACKOFF = 2  # exponential backoff base
 
 SIMILARITY_PROMPT = """\
-You are a job analyst comparing two occupations based on their **Key Duties** and **Education & Skills**.
+You are a job analyst comparing two occupations.
+Analyze duty overlap, skill overlap, and overall similarity.
 
-You will receive descriptions of two occupations. Your task is to:
-1. Extract the key duties from each occupation
-2. Extract the education and skills requirements from each
-3. Compare them for similarity
-4. Provide a **Job Similarity Score** from 0-100
-
-Scoring guidelines:
-- **90-100: Nearly identical jobs.** Same duties, same education/skills.
-  Examples: Software Developer vs Software Engineer, Registered Nurse vs RN
-  
-- **75-89: Very similar jobs.** 80%+ overlap in duties and requirements.
-  Examples: Electrician vs Electrical Technician, Accountant vs Bookkeeper
-  
-- **60-74: Similar jobs.** Significant overlap in duties (50-75%) and education.
-  Examples: Teacher vs Trainer, Graphic Designer vs Web Designer
-  
-- **40-59: Moderately similar.** Some overlap in skills/education but different core duties.
-  Examples: Carpenter vs Electrician, Nurse vs Medical Assistant
-  
-- **20-39: Somewhat related.** Limited overlap, different fields but adjacent.
-  Examples: Data Analyst vs Business Analyst, Marketing Manager vs Sales Manager
-  
-- **0-19: Unrelated jobs.** Minimal overlap in duties or requirements.
-  Examples: Software Developer vs Dentist, Roofer vs Accountant
-
-Respond with ONLY a JSON object in this exact format, no other text:
+Return ONLY valid JSON in this exact format:
 {
   "similarity_score": <0-100>,
   "duty_overlap_percent": <0-100>,
   "skill_overlap_percent": <0-100>,
-  "shared_duties": ["<duty1>", "<duty2>", ...],
-  "shared_skills": ["<skill1>", "<skill2>", ...],
-  "key_differences": ["<difference1>", "<difference2>", ...],
-  "rationale": "<2-3 sentences explaining the score>"
+  "shared_duties": ["<duty1>", "<duty2>", "<duty3>"],
+  "shared_skills": ["<skill1>", "<skill2>", "<skill3>"],
+  "key_differences": ["<diff1>", "<diff2>"],
+  "rationale": "<explanation>"
 }
 """
 
 
+# ============================================================================
+# CACHE CLASS
+# ============================================================================
+
 class SimilarityCache:
     """Manages caching with incremental saving and resume capability."""
     
-    def __init__(self, cache_file=CACHE_FILE):
+    def __init__(self, cache_file=SIMILARITY_CACHE):
         self.cache_file = cache_file
         self.cache = {}
         self.comparisons_made = 0
@@ -142,6 +114,10 @@ class SimilarityCache:
             "comparisons_cached": self.comparisons_cached,
         }
 
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 
 def load_csv_data():
     """Load job data from CSV."""
@@ -249,6 +225,10 @@ Compare these jobs.
     raise Exception(f"Failed after {MAX_RETRIES} retries")
 
 
+# ============================================================================
+# MAIN FUNCTIONS
+# ============================================================================
+
 def find_similar_jobs(target_slug, top_n=10):
     """Find similar jobs for a target job."""
     
@@ -276,8 +256,8 @@ def find_similar_jobs(target_slug, top_n=10):
     
     print(f"🔍 Finding similar jobs to: {target_title}")
     print(f"📊 Model: {GEMINI_MODEL}")
-    print(f"⏱️  Rate limit: 0.3s between calls")
-    print(f"💾 Cache file: {CACHE_FILE}")
+    print(f"⏱️  Rate limit: {RATE_LIMIT_DELAY}s between calls")
+    print(f"💾 Cache file: {SIMILARITY_CACHE}")
     print(f"Comparing against {len(jobs)} occupations...\n")
     
     similarities = []
@@ -349,7 +329,7 @@ def find_similar_jobs(target_slug, top_n=10):
     print(f"📝 Total cached: {stats['total_cached']}")
     print(f"🆕 New API calls: {stats['comparisons_made']}")
     print(f"♻️  From cache: {stats['comparisons_cached']}")
-    print(f"💾 Cache file: {CACHE_FILE}")
+    print(f"💾 Cache file: {SIMILARITY_CACHE}")
     print(f"📄 Results file: {output_file}")
     print(f"⏱️  Daily limit: 1.5M tokens (track at console.cloud.google.com)")
 
@@ -432,9 +412,15 @@ def batch_compare_jobs(target_slugs, top_n=10):
     print(f"Total comparisons: {stats['comparisons_made'] + stats['comparisons_cached']}")
     print(f"New API calls: {stats['comparisons_made']}")
     print(f"From cache: {stats['comparisons_cached']}")
-    print(f"Cache efficiency: {(stats['comparisons_cached']/(stats['comparisons_made']+stats['comparisons_cached'])*100):.1f}%")
-    print(f"Cache file: {CACHE_FILE} ({len(cache.cache)} entries)")
+    if stats['comparisons_made'] + stats['comparisons_cached'] > 0:
+        efficiency = (stats['comparisons_cached']/(stats['comparisons_made']+stats['comparisons_cached'])*100)
+        print(f"Cache efficiency: {efficiency:.1f}%")
+    print(f"Cache file: {SIMILARITY_CACHE} ({len(cache.cache)} entries)")
 
+
+# ============================================================================
+# CLI INTERFACE
+# ============================================================================
 
 if __name__ == "__main__":
     import argparse
@@ -466,11 +452,14 @@ if __name__ == "__main__":
         if args.stats:
             print(f"\n📊 Cache Statistics:")
             print(f"   Total entries: {len(cache.cache)}")
-            print(f"   File: {CACHE_FILE}")
-            print(f"   File size: {os.path.getsize(CACHE_FILE) / 1024:.1f} KB")
+            print(f"   File: {SIMILARITY_CACHE}")
+            if os.path.exists(SIMILARITY_CACHE):
+                print(f"   File size: {os.path.getsize(SIMILARITY_CACHE) / 1024:.1f} KB")
         elif args.clear:
             cache.cache = {}
             cache.save()
             print("✅ Cache cleared")
+        else:
+            cache_cmd.print_help()
     else:
         parser.print_help()
