@@ -1,0 +1,27 @@
+name: Similarity Scoring
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install google-generativeai python-dotenv
+      
+      - name: Run similarity scoring
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python similarity_score_gemini.py single medical-transcriptionists --top 20
