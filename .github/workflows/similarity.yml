@@ -25,3 +25,10 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python similarity_score_gemini.py single medical-transcriptionists --top 20
+          
+      - name: Upload cache
+        uses: actions/upload-artifact@v3
+        with:
+          name: similarity-cache
+          path: similarity_cache.json
+          retention-days: 30
